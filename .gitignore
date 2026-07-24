@@ -20,3 +20,6 @@ node_modules/
 
 # Local settings that should not be shared
 *.local.json
+
+# Hook-generated log
+training-repo/.claude/hooks/edit-log.txt

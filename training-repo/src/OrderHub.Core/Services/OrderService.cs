@@ -38,14 +38,9 @@ public class OrderService : IOrderService
         if (customer is null)
             return ServiceResult<Order>.Fail("找不到指定的客戶");
 
-        if (lines is null || lines.Count == 0)
-            return ServiceResult<Order>.Fail("訂單至少需要一項商品");
-
-        if (lines.Any(l => l.Quantity <= 0))
-            return ServiceResult<Order>.Fail("商品數量必須大於 0");
-
-        if (lines.Select(l => l.ProductId).Distinct().Count() != lines.Count)
-            return ServiceResult<Order>.Fail("同一商品請勿重複加入，請調整數量即可");
+        var requestError = ValidateOrderRequest(lines);
+        if (requestError is not null)
+            return ServiceResult<Order>.Fail(requestError);
 
         var errors = new List<string>();
         var order = new Order
@@ -58,31 +53,20 @@ public class OrderService : IOrderService
         foreach (var line in lines)
         {
             var product = await _productRepository.GetByIdAsync(line.ProductId);
-            if (product is null || !product.IsActive)
+            var lineError = ValidateLine(product, line);
+            if (lineError is not null)
             {
-                errors.Add($"商品（Id={line.ProductId}）不存在或已停售");
+                errors.Add(lineError);
                 continue;
             }
 
-            if (product.StockQuantity < line.Quantity)
-            {
-                errors.Add($"商品「{product.Name}」庫存不足（現有 {product.StockQuantity}，需求 {line.Quantity}）");
-                continue;
-            }
-
-            product.StockQuantity -= line.Quantity;
-
-            var unitPrice = product.UnitPrice;
-            if (customer.Tier == CustomerTier.Gold)
-            {
-                unitPrice = Math.Round(unitPrice * (1 - GetDiscountRate(customer.Tier)), 2);
-            }
+            product!.StockQuantity -= line.Quantity;
 
             order.Items.Add(new OrderItem
             {
                 ProductId = product.Id,
                 Quantity = line.Quantity,
-                UnitPriceSnapshot = unitPrice
+                UnitPriceSnapshot = product.UnitPrice
             });
         }
 
@@ -95,6 +79,31 @@ public class OrderService : IOrderService
         return ServiceResult<Order>.Ok(order);
     }
 
+    private static string? ValidateOrderRequest(IReadOnlyList<NewOrderLine> lines)
+    {
+        if (lines is null || lines.Count == 0)
+            return "訂單至少需要一項商品";
+
+        if (lines.Any(l => l.Quantity <= 0))
+            return "商品數量必須大於 0";
+
+        if (lines.Select(l => l.ProductId).Distinct().Count() != lines.Count)
+            return "同一商品請勿重複加入，請調整數量即可";
+
+        return null;
+    }
+
+    private static string? ValidateLine(Product? product, NewOrderLine line)
+    {
+        if (product is null || !product.IsActive)
+            return $"商品（Id={line.ProductId}）不存在或已停售";
+
+        if (product.StockQuantity < line.Quantity)
+            return $"商品「{product.Name}」庫存不足（現有 {product.StockQuantity}，需求 {line.Quantity}）";
+
+        return null;
+    }
+
     public async Task<ServiceResult<Order>> CancelOrderAsync(int id)
     {
         var order = await _orderRepository.GetWithDetailsAsync(id);
@@ -104,17 +113,14 @@ public class OrderService : IOrderService
         if (order.Status != OrderStatus.Pending && order.Status != OrderStatus.Confirmed)
             return ServiceResult<Order>.Fail($"狀態為 {order.Status} 的訂單不可取消");
 
-        order.Status = OrderStatus.Cancelled;
-
-        if (order.Status == OrderStatus.Pending || order.Status == OrderStatus.Confirmed)
+        foreach (var item in order.Items)
         {
-            foreach (var item in order.Items)
-            {
-                var product = await _productRepository.GetByIdAsync(item.ProductId);
-                if (product is not null)
-                    product.StockQuantity += item.Quantity;
-            }
+            var product = await _productRepository.GetByIdAsync(item.ProductId);
+            if (product is not null)
+                product.StockQuantity += item.Quantity;
         }
+
+        order.Status = OrderStatus.Cancelled;
 
         await _orderRepository.SaveChangesAsync();
 
