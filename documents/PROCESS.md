@@ -65,21 +65,28 @@ Claude Code（Sonnet 5），搭配 Claude in Chrome 做瀏覽器端重現與驗�
 
 練習 3
 
-1. `/Products/LowStock` 不帶參數 → 門檻 10 的結果；帶 `?threshold=3` → 結果隨之改變
-2. `?threshold=0`、`?threshold=-1` → 頁面顯示驗證錯誤，不是 500
-3. 售出數量欄位排除了 Cancelled 訂單（可用一筆已取消的訂單驗證）
-4. 停售（已停售 badge）商品不出現在列表
-5. 程式分層與命名跟既有的 Products 功能一致（請 agent 自我 review 一次，並自己確認）
-6. 至少 3 個新測試，`dotnet test` 全綠
+1. [x] `/Products/LowStock` 不帶參數 → 門檻 10 的結果（實測回傳 5 筆，庫存 2~4）；帶 `?threshold=20` → 結果變 7 筆，含庫存 17、18 的商品。
+2. [x] `?threshold=0` 頁面顯示「門檻必須是大於 0 的整數」、`?threshold=-1` 同樣顯示驗證訊息；兩者 HTTP 狀態碼皆為 200，不是 500（用 `Invoke-WebRequest` 確認過）。
+3. [x] 售出數量排除 Cancelled：service 測試 `GetLowStock_Sold30Days_ExcludesCancelledOrders` 用一筆 Confirmed（數量3）+一筆 Cancelled（數量100）驗證結果是 3 不是 103。
+4. 停售商品不出現：repository 查詢帶 `p.IsActive` 條件，並有 `GetLowStock_ExcludesInactiveProducts` 測試覆蓋。
+5. [x] 分層跟既有 Products 功能一致：Controller 只做 ViewModel↔Core 結果映射；EF 查詢在 `ProductRepository`；30 天門檻計算放在 `ProductService`（讓 repository 保持純查詢、好測）；驗證用 DataAnnotations `[Range]`，跟 `CreateOrderViewModel` 同一套。
+6. [x] 3 個新測試（門檻過濾+排序、排除停售、售出數量排除 Cancelled），`dotnet test` 36 個全綠。
 
 練習 4
 
-1. 重構後 `dotnet test` 全綠
-2. 我能說出這次重構「改善了什麼、沒有改變什麼」
-3. 我有在 code review 的角度看過 diff（不是 agent 說好就好）
+1. [x] 重構後 `dotnet test` 36 個全綠，行為完全沒變。
+2. 改善：把 `CreateOrderAsync` 裡「請求層級驗證」（明細非空、數量、重複商品）與「單行驗證」（商品存在/停售/庫存）拆成兩個獨立、不碰 DB 的私有靜態方法，方法本體變短、驗證規則各自可讀。沒改變：仍是同一個 `OrderService`、沒有新增 interface 或 DI 註冊、錯誤訊息文字逐字不變、呼叫端完全無感。
+3. diff 只多兩個 private static method、原本的 if 判斷搬過去但文字不變——確認過沒有夾帶練習 3 以外的改動。
 
 ---
 
 ## 附錄：值得留下的對話片段
 
-（貼 1–2 段最有代表性的 prompt 與回應**摘要**——不用貼全文，重點是「我怎麼問」和「它怎麼答」。）
+**片段 1（練習 2，客訴 1）**
+問法：「開 http://localhost:5150/Orders，建一筆新訂單記下編號，回列表第一頁找找看；再點分頁的最後一頁。」
+（實際操作：建立訂單 #201，回到 `/Orders` 第一頁——最上面是 07-15 的舊訂單，#201 完全不在頁1；點到頁11顯示「沒有符合條件的訂單」。）
+回應摘要：agent 直接讀 `OrderRepository.GetPagedAsync`，指出 `Skip(page * pageSize)` 在 `page` 從 1 起算時會多跳過一頁，應改成 `Skip((page - 1) * pageSize)`；並解釋這同時解釋了「新單不在頁1」和「頁11空白」兩個症狀（同一根因），不是兩個獨立 bug。
+
+**片段 2（練習 2，客訴 2）**
+問法：「到 /Products 記下 SKU-1002 原價 NT$2,320 → 用 Gold 客戶建一筆該商品 x1 的訂單 → 明細頁應付 NT$1,879.20，手算應該是 2,320*0.9=2,088 → 再用 Silver 客戶做對照組，Silver 顯示 NT$2,204（2,320*0.95，正確）。」
+回應摘要：agent 讀 `CreateOrderAsync` 發現只有 `customer.Tier == Gold` 時會把折扣先套進 `UnitPriceSnapshot`，`CalculateTotal` 之後又套一次；建議修法是「快照永遠存原價，折扣只在 `CalculateTotal` 算一次」，並主動指出既有測試 `CreateOrder_SnapshotsCurrentUnitPrice` 只測了 Standard 會員、從沒測到這條路徑。
