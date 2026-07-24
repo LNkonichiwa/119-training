@@ -263,7 +263,7 @@ rules 擋的是「指令長相」，hook 可以檢查**內容**。
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -File .codex/hooks/log-edits.ps1",
+            "command": "powershell -NoProfile -File .codex/hooks/log-edits-codex.ps1",
             "statusMessage": "Logging file edit..."
           }
         ]
