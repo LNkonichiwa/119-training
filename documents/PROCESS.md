@@ -90,3 +90,65 @@ Claude Code（Sonnet 5），搭配 Claude in Chrome 做瀏覽器端重現與驗�
 **片段 2（練習 2，客訴 2）**
 問法：「到 /Products 記下 SKU-1002 原價 NT$2,320 → 用 Gold 客戶建一筆該商品 x1 的訂單 → 明細頁應付 NT$1,879.20，手算應該是 2,320*0.9=2,088 → 再用 Silver 客戶做對照組，Silver 顯示 NT$2,204（2,320*0.95，正確）。」
 回應摘要：agent 讀 `CreateOrderAsync` 發現只有 `customer.Tier == Gold` 時會把折扣先套進 `UnitPriceSnapshot`，`CalculateTotal` 之後又套一次；建議修法是「快照永遠存原價，折扣只在 `CalculateTotal` 算一次」，並主動指出既有測試 `CreateOrder_SnapshotsCurrentUnitPrice` 只測了 Standard 會員、從沒測到這條路徑。
+
+---
+
+## 第二階段 — 自建 MCP Server（活動 2）
+
+### 練習 0 — 接 Playwright MCP
+
+`claude mcp add playwright -- npx @playwright/mcp@latest`（在 `training-repo` 目錄下、local scope）執行成功，`claude mcp list` 確認 `playwright: ✔ Connected`。
+
+對比活動 1 練習 2：現在同一組操作 agent 自己用瀏覽器工具做完，我只需要口頭描述「建一筆訂單，截圖結果頁」。差異不是「agent 比較聰明」，而是**多了一種工具**：沒有瀏覽器工具時，agent 對「頁面上發生了什麼」是瞎的，只能靠我口述症狀；有了以後，agent 能自己去看、自己去重現。
+
+### 練習 1 — 建立 OrderHub MCP Server
+
+`src/OrderHub.Mcp` 新增 3 個唯讀工具（`get_order`、`low_stock`、`customer_orders`），走 `IOrderService`/`IProductRepository`，折扣規則重用 `OrderService`，不重算。
+
+踩到地雷區原文警告的雷：用 `dotnet run --project ... < 輸入檔` 直接測試時，stdout 完全是空的——`dotnet run` 自己的 stdio 轉發似乎會在 stdin EOF 後就把還沒 flush 完的回應吞掉。改成直接呼叫編譯後的 `.exe`、並用 `{ cat 輸入檔; sleep 3; }` 讓 stdin 晚一點關閉，兩個請求（`initialize`、`tools/list`）才正常收到回應。
+
+### 練習 2 — 用 MCP Inspector 除錯
+
+`npx @modelcontextprotocol/inspector dotnet run --project src/OrderHub.Mcp` 啟動後開瀏覽器連線：
+
+1. [x] List Tools 顯示 `customer_orders`、`get_order`、`low_stock` 三個工具，description 與程式裡寫的逐字一致
+2. [x] `low_stock`（threshold=10）回傳 SKU-1048（庫存2）、SKU-1005（庫存3）排第一二名，和 `/Products/LowStock` 頁面（練習 3 活動1）的順序完全一致
+3. [x] `get_order`（id=999999）回傳 `"找不到訂單 999999"`，Tool Result 顯示 Success（工具本身正常執行，只是查無資料），不是 exception stack trace
+
+### 練習 3 — 註冊給 agent，before/after 對照
+
+`training-repo/.mcp.json` 建立並進 git（`{"mcpServers":{"orderhub":{"command":"dotnet","args":["run","--project","src/OrderHub.Mcp"]}}}`）。
+
+`claude mcp list` 在 `training-repo` 目錄下執行，確認 CLI 有偵測到這個專案層級的 server：`orderhub: dotnet run --project src/OrderHub.Mcp - ⏸ Pending approval (run 'claude' to approve)`——這個「待核准」狀態本身就是重點：專案共用的 `.mcp.json` 不會自動被信任執行，要有人在真的開一個 session 時手動核准，才會真正連上。
+
+**沒有 MCP 工具（用 sqlcmd 直接查 DB）：**
+```
+sqlcmd -S localhost -d OrderHubTraining -E -Q "SELECT Sku, Name, StockQuantity FROM Products WHERE StockQuantity < 5 AND IsActive = 1 ORDER BY StockQuantity ASC"
+```
+要自己想清楚要查哪張表、欄位名稱、拼 SQL、加 `IsActive` 條件——這些都是**只有讀過 code 或 schema 的人才知道的細節**。
+
+**有 MCP 工具（透過 Inspector 呼叫 `low_stock`，threshold=5）：**
+一次工具呼叫、參數只有一個 `threshold`，結果直接是結構化 JSON（`Sku`/`Name`/`StockQuantity`），兩邊資料一模一樣（SKU-1048=2、SKU-1005=3、SKU-1023=3、SKU-1032=4、SKU-1014=4）。
+
+差異：沒有工具時，agent 要嘛去讀 `ProductRepository`/DbContext 猜表結構、嘛請人代勞跑 SQL；有了工具後，「庫存規則」（`IsActive`、排序方向）已經封裝在 server 裡，agent 只需要知道「有一個叫 low_stock 的工具，給它門檻就好」——**這正是 MCP 的核心價值：把『怎麼查』的知識從 agent 的推理搬到 server 的實作**，也是 Resource/Prompt 想解決的同一類問題（練習 5 會再碰到）。
+
+### 練習 4 — 會改資料的工具：cancel_order
+
+`cancel_order` 新增（`Destructive = true, Idempotent = false`），三個唯讀工具補上 `ReadOnly = true`。透過 Inspector 的 `tools/list` 展開 `annotations` 欄位逐一核對：
+
+1. [x] `get_order` → `{ readOnlyHint: true }`；`cancel_order` → `{ destructiveHint: true, idempotentHint: false }`，和程式碼標註一致
+2. [x] 先建立訂單 #209（蔡承翰，SKU-1001 x1，庫存 26→25），呼叫 `cancel_order(209)` → `"訂單 209 已取消，庫存已回補"`，回 `/Products` 確認 SKU-1001 庫存回到 26
+3. [x] 對同一筆訂單（209，已是 Cancelled）**在完全獨立的第二次呼叫**再叫一次 `cancel_order` → `"取消失敗：狀態為 Cancelled 的訂單不可取消"`，清楚訊息，不是 exception dump；庫存仍是 26，沒有被錯誤地再加一次
+
+### 練習 5 — Resource 與 Prompt
+
+新增 `OrderHubResources.cs`（`orderhub://discount-rules`，text/markdown，靜態內容：三個會員等級的折扣率與「折扣只在總額上算一次、UnitPriceSnapshot 是下單當下原價」這句話）與 `OrderHubPrompts.cs`（`low_stock_report`，帶一個 `threshold`（預設10）參數，展開成一段要 agent 先呼叫 `low_stock` 再彙整成採購建議表的提示詞）。`Program.cs` 接上 `.WithResources<OrderHubResources>().WithPrompts<OrderHubPrompts>()`。
+
+MCP Inspector 的瀏覽器操作這階段一直不穩定（連線常斷、截圖偶爾卡住），改用原始 stdio 直接送 JSON-RPC 驗證（跟練習1踩雷後的作法一樣，把輸入用 `{ cat 輸入檔; sleep 3; }` 餵給編譯後的 `.exe`）：
+
+1. [x] `resources/list` 回傳 `orderhub://discount-rules`，name/description/mimeType 都對；`resources/read` 讀出來的文字跟 `DiscountRules()` 裡寫的逐字一致
+2. [x] `prompts/list` 顯示 `low_stock_report`，帶一個非必填的 `threshold` 參數（description 寫著「庫存門檻，預設 10」）
+3. [x] `prompts/get`（threshold=8）展開後的訊息正確把 8 代入模板：「請用 low_stock 工具（threshold=8）查出低庫存商品…」
+
+思考題（5c 第 3 點）：
+規則只有一份，改版時只要改這裡；讓 agent 自己讀 code，等於每次都要重新爬一次，而且沒人保證它讀對版本（例如漏看 Gold 的雙重折扣 bug 就是活動1練習2的教訓）。Prompt 放 server vs 每個人自己打字：`low_stock_report` 這段提示詞進了 git，全隊問法一致、之後要調整「輸出表格要不要加理由欄」只要改一個地方；每個人自己打，問法會慢慢分歧，而且新人不知道該怎麼問。兩者都是同一堂課：**把『怎麼做』的知識從『每次重新推理/重新打字』搬到『寫一次、大家共用、進版控』**。
