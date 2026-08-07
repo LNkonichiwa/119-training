@@ -6,6 +6,7 @@
       "Bash(git reset --hard *)",
       "Read(**/appsettings.Production.json)",
       "Read(**/*.pfx)",
+      "Read(**/UserSecrets/**)",
       "Edit(src/OrderHub.Infrastructure/Migrations/**)"
     ],
     "ask": ["Bash(dotnet ef database drop *)", "Bash(git push *)"],
