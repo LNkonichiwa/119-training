@@ -152,3 +152,80 @@ MCP Inspector 的瀏覽器操作這階段一直不穩定（連線常斷、截圖
 
 思考題（5c 第 3 點）：
 規則只有一份，改版時只要改這裡；讓 agent 自己讀 code，等於每次都要重新爬一次，而且沒人保證它讀對版本（例如漏看 Gold 的雙重折扣 bug 就是活動1練習2的教訓）。Prompt 放 server vs 每個人自己打字：`low_stock_report` 這段提示詞進了 git，全隊問法一致、之後要調整「輸出表格要不要加理由欄」只要改一個地方；每個人自己打，問法會慢慢分歧，而且新人不知道該怎麼問。兩者都是同一堂課：**把『怎麼做』的知識從『每次重新推理/重新打字』搬到『寫一次、大家共用、進版控』**。
+
+---
+
+## 第三階段 — n8n 自動化（活動 4）
+
+n8n 是使用者自己在本機用 `npx n8n` 裝的（不是我裝的），整條流程都在 `http://localhost:5678` 的瀏覽器 UI 裡搭建、用 Claude in Chrome 操作與截圖驗證，不是本機檔案，所以這裡沒有 diff 可貼，只能記真實觀察到的數字、log、錯誤訊息。
+
+### 補齊 — MCP server 加開 HTTP transport
+
+`OrderHub.Mcp.csproj` 加 `<FrameworkReference Include="Microsoft.AspNetCore.App" />` + `ModelContextProtocol.AspNetCore` `2.0.0`（既有 `ModelContextProtocol` 鎖的就是 `2.0.0` 不是文件寫的 `preview.2`，兩邊版本本來就對齊，沒踩到文件警告的 NU1605）。`Program.cs` 照文件雙 transport 寫：`--http` 走 `WebApplication` + `WithHttpTransport(options => options.Stateless = true)`，port 3001；不帶參數照舊走 stdio。
+
+驗證（用 curl 送 JSON-RPC，取代文件建議的 Inspector，效果等價）：
+
+```
+curl -X POST http://localhost:3001/ -d '{"jsonrpc":"2.0","id":1,"method":"initialize",...}'
+→ {"result":{"protocolVersion":"2024-11-05","capabilities":{"logging":{},"prompts":{},"resources":{},"tools":{}},"serverInfo":{"name":"OrderHub.Mcp","version":"1.0.0.0"}}}
+
+curl -X POST http://localhost:3001/ -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+→ 4 個工具：customer_orders、get_order、low_stock（readOnlyHint:true）、cancel_order（destructiveHint:true, idempotentHint:false）
+
+curl -X POST http://localhost:3001/ -d '{"jsonrpc":"2.0","id":3,"method":"resources/list"}'
+→ 1 個 resource：orderhub://discount-rules
+
+curl -X POST http://localhost:3001/ -d '{"jsonrpc":"2.0","id":4,"method":"prompts/list"}'
+→ 1 個 prompt：low_stock_report
+```
+
+- [x] 四個工具、resource、prompt 都列得出來，跟活動 2 stdio 版一致（換的只是 transport）
+- [x] 不帶 `--http` 照舊走 stdio：沒有回歸（這條路徑本身沒改動，只是被抽成共用的 `AddOrderHubServices`）
+- [ ] 獨立 commit——目前 `OrderHub.Mcp.csproj`、`Program.cs` 還是 working tree 裡的修改（`git status` 顯示 `M`），使用者說要自己 commit，先不動
+
+### 練習 1 — Hello Webhook
+
+Webhook（POST）→ Edit Fields（`receivedAt` = Expression `{{ $now.toISO() }}`，開 **Include Other Input Fields**）→ Respond to Webhook（**First Incoming Item**）。這台機器的 PowerShell `Invoke-RestMethod`/`Invoke-WebRequest` 在這個環境下會報 `NonInteractive mode...IE engine` 的錯，改用 `curl.exe` 送 `{"text":"hello"}`，回應正確含 `text:"hello"` + `receivedAt` 時間戳，畫布三個節點全部亮綠勾。
+
+- [x] 回應含送出的內容 + 時間戳
+- [x] 驗證過 Test URL 的限制：沒先按 Listen 就直接打會沒有回應；按下 Listen 後 120 秒內、收到一發請求就自動停止，跟文件描述一致
+
+### 練習 2 — 退單巡檢日報（主菜）
+
+流程：Schedule Trigger → HTTP Request（POST `/api/orders/search`）→ 整理筆數（Code）→ AI Agent + Google Gemini Chat Model → If（count > 0）→ true: GitHub 開 issue / false: Data Table 歸檔。真實素材：訂單 #210（陳志明，Gold 會員，SKU-1005 極光筆電支架，已取消，總額 NT$2,691，取消時間 2026-09-11）。
+
+**跟文件不同的地方，都有具體原因：**
+
+- **Model 名稱**：文件寫 `gemini-3.5-flash`，實際填這個名字執行會報 `[404 Not Found] This model...is no longer supported`（已下架），改用滾動別名 `gemini-flash-latest` 才過。
+- **GitHub issue 一次失敗一次成功**：第一次執行在 GitHub 節點卡在 `Issues has been disabled in this repository`——這時 repo 設定裡 Issues 功能是關的，沒開；請人到 repo 設定打開 Issues 後重跑，才真的開出 issue [#10](https://github.com/LNkonichiwa/119-training/issues/10)。
+- **Data Table 名稱**：文件寫 `巡檢紀錄`，實際叫「退單稽查紀錄」——打字工具在輸入「巡」這個字時，兩次獨立嘗試都被替換成別的字，換掉這個字才正常，單純是操作工具的怪癖，跟資料表用途無關。
+
+**踩到兩個文件沒提到的真實 bug：**
+
+1. If 節點的條件在一次瀏覽器凍結、重新整理之後被重置成空白 placeholder（`value1`/`value2`，型別掉回預設的 String `is equal to`），等於「空字串等於空字串」永遠成立，不管 count 是多少都走 true 分支。改回 `{{ $('整理筆數').item.json.count }}`、Number、`is greater than`、`0` 才修好——這也解釋了為什麼一開始怎麼測都測不出 false 分支被真正執行過。
+2. 把新的 Data Table 節點插進 If 的 false 輸出「+」時，n8n 把節點接在原本「false→GitHub」那條線的中間，新節點後面自動留了一條「Insert row → GitHub」的連線——false 分支被插入節點後，居然還是會接著開 issue。手動刪掉這條多餘連線後，false 才只做歸檔、不再開 issue。
+
+**驗證 false 分支時的意外發現**：`/api/orders/search`（`OrderSearchService.SearchAsync` → `IOrderQueryTranslator.TranslateAsync`，活動 3 做的）是把查詢句子交給 Gemini 翻譯成結構化篩選條件，不是單純字串比對——同一句「過去 30 天取消的訂單」在同一個上午分別呼叫，回傳筆數是 1 筆、26 筆、又 1 筆，不是穩定值。這代表想靠改查詢文字去強迫觸發 false 分支（文件建議的「把查詢文字改成查不到東西的條件」）本身就不可靠——改完文字這次可能真的查不到，但重跑整條 workflow 時 Gemini 翻譯結果可能又不一樣。改用單節點 **Execute step** 隔離測試，拿掉這個不確定性後才拿到穩定結論：
+
+- If 節點單獨執行，輸入 `count=0` 時 Output 分頁顯示 **False Branch (1 item)**；`count>0` 時顯示 **True Branch**——條件邏輯本身正確。
+- Insert row 節點單獨執行，真的寫入一列（`id:3, date:"2026-09-12", note:"本日無退單"`）進 Data Table——歸檔邏輯正確。
+
+- [x] 先準備素材：訂單 #210 已是待處理單，直接在網站標記取消
+- [x] Execute workflow：開出真實 issue [#10](https://github.com/LNkonichiwa/119-training/issues/10)；日報數字（1 筆、NT$2,691）跟 `/Orders` 篩「已取消」肉眼比對一致
+- [x] false 分支邏輯用單節點隔離測試驗證過（見上），而非仰賴一次剛好查無資料的整條流程執行——因為查詢本身不是決定性的
+- [x] 思考題：如果「查什麼、怎麼查」也交給 AI Agent 自由發揮，會失去什麼？
+  現在查詢字串是 HTTP Request 節點裡寫死的 `"過去 30 天取消的訂單"`，送進活動 3 已經做好白名單防線的 `/api/orders/search`——`OrderSearchService` 裡「翻譯失敗、意圖不是查詢、沒有任何有效篩選條件」一律回 `Fail("無法理解的查詢")`，這一關已經測試過、可重現。如果讓 AI Agent 自己決定每次要送什麼查詢句子，等於把「查詢意圖要怎麼措辭」的責任從一句固定、測過的 prompt，搬到 agent 每次臨場生成的文字上——同一個排程觸發、同一天，agent 可能寫出「近期取消訂單」「過去一個月的退貨」等不同說法，而 `IOrderQueryTranslator` 對措辭本身就敏感（這次踩到的非決定性——同句話三次呼叫回傳 1/26/1 筆——就是活生生的例子）。日報數字的可信度會直接打折：看報告的人沒辦法確定「今天總筆數 1」是「真的只有 1 筆退單」還是「AI 那次剛好問得比較窄」，而且沒有一個固定的字串可以拿去重現、debug。文件裡「查詢在產品程式碼裡，n8n 只做編排」這句話的價值，就是把這個不確定性焊死在一個寫死的字串上：可測試、可重現、出錯了也只有一個地方要查。
+
+### 練習 3 — MCP 合體
+
+AI Agent 節點掛 **MCP Client Tool**：Endpoint `http://localhost:3001`、Server Transport **HTTP Streamable**、Authentication **None**、Tools to Include 選 **Selected** → 只勾 `get_order`（`cancel_order` 絕不掛進這條無人巡檢流程，跟活動 1 的 approval 哲學是同一件事：根本不給工具，而不是靠 prompt 叫它不要用）。System Message 加一句：「對每筆取消的訂單，先用工具查出品項明細與會員等級，日報中引用查到的實際數字。」
+
+中途撞到一次跟設定無關的暫時性錯誤：`Problem in node 'AI Agent': Service unavailable - try again later`（Gemini API 端暫時忙），重跑一次就過。
+
+- [x] Executions 分頁（執行 #24，13:28:18，耗時 19.72s）點開 AI Agent 節點的 Logs，子步驟清楚列出一次 `MCP Client` 呼叫：
+  - Input：`query.id: 210`、`tool.name: get_order`
+  - Output：`{"Id":210,"Status":"Cancelled","Customer":{"Id":1,"Name":"陳志明","Tier":"Gold"},"Sku":"SKU-1005",...}`
+  這是「有沒有真的深挖」的直接證據，不是我讀 log 腦補的。
+- [x] 有深挖 vs 沒深挖對照（同一筆退單 #210）：
+  - **練習 2（沒深挖）**：日報只有 `/api/orders/search` 回傳的六個欄位——訂單編號、客戶姓名、會員等級、總額、狀態、建立時間，看不到買了什麼。原文：「近 30 天退單共 1 筆，含 1 筆 Gold 會員退單，總金額 2,691 元…訂單編號 #210 | 客戶：陳志明（Gold 會員）| 金額：2,691 元」。
+  - **練習 3（有深挖）**：日報多出一段「品項明細：極光筆電支架（SKU-1005）x 1，單價 2,990 元，小計 2,990 元」，並補上「訂單金額：2,691 元（原小計 2,990 元，享 10% 折扣）」——SKU、原價、折扣率這幾個數字完全不在 search API 的回傳欄位裡，只有 `get_order` 這個 MCP 工具會回傳，證明報告內容確實來自工具呼叫，不是 AI 自己編的。
